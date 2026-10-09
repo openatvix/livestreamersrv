@@ -6,7 +6,7 @@
 # License: GPLv2+
 #
 
-__version__ = "8.6.1"
+__version__ = "8.6.2"
 __optparserversion__ = "0.4.0"
 
 import argparse

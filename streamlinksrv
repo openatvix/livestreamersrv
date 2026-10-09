@@ -1,0 +1,1438 @@
+#!/usr/bin/env python3
+#
+# Linux Python 3 Streamlink Daemon
+# Copyright (c) 2017 - 2021 Billy2011 @vuplus-support.org
+# 2026 Optimized for DM920
+# License: GPLv2+
+#
+
+__version__ = "8.6.1"
+__optparserversion__ = "0.4.0"
+
+import argparse
+import atexit
+import errno
+import logging
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import sys
+import time
+import traceback
+import warnings
+import gc
+import json
+import subprocess
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
+
+from platform import node as hostname
+from requests.adapters import HTTPAdapter
+from requests import __version__ as requests_version
+from urllib.parse import unquote, urlparse
+from websocket import __version__ as websocket_version
+
+from shlex import split as argsplit
+from string import printable
+from textwrap import dedent
+from contextlib import contextmanager
+from collections import OrderedDict
+
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+
+try:
+    from socks import __version__ as socks_version
+except ImportError:
+    socks_version = "N/A"
+
+import streamlink.logger as logger
+from streamlink import PluginError, NoStreamsError, NoPluginError, StreamError
+from streamlink import Streamlink
+from streamlink import plugins
+from streamlink.exceptions import FatalPluginError
+from streamlink import __version__ as streamlink_version
+from streamlink.options import Options
+from streamlink.utils.args import comma_list, comma_list_filter, filesize, keyvalue, num
+from streamlink.utils.times import hours_minutes_seconds_float
+from streamlink.stream.http import HTTPStream
+from streamlink.stream.ffmpegmux import MuxedStream
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.dash import DASHStream
+
+
+try:
+    from yt_dlp.version import __version__ as ytdl_version
+except ImportError:
+    ytdl_version = "N/A"
+
+PORT_NUMBER = 8088
+LOGLEVEL = "warning"
+
+LOGGER = logging.getLogger("streamlink.streamlinksrv")
+STREAM_SYNONYMS = ["best", "worst", "best-unfiltered", "worst-unfiltered"]
+PARSER = None
+PLUGIN_ARGS = False
+
+STREAM_PASSTHROUGH = ["hls", "http", "hls-multi", "dash"]
+XDG_CONFIG_HOME = "/home/root/.config"
+XDG_STATE_HOME = "/home/root/.local/state"
+CONFIG_FILES = [
+    os.path.expanduser(XDG_CONFIG_HOME + "/streamlink/config"),
+    os.path.expanduser(XDG_CONFIG_HOME + "/.streamlinkrc")
+]
+PLUGINS_DIR = os.path.expanduser(XDG_CONFIG_HOME + "/streamlink/plugins")
+LOG_DIR = os.path.expanduser(XDG_STATE_HOME + "/streamlink/logs")
+
+# Chrome User Agent - Same as all other components
+DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# DM920 ULTIMATE OPTIMIZED CONFIG
+BUFFER_CONFIG = {
+    "DEFAULT_PREBUFFER": 32768,              # Increased for faster start
+    "STREAM_CHUNK_SIZE": 512 * 1024,
+    "MAX_RETRIES": 3,
+    "RETRY_DELAY": 0.5,
+    "ENIGMA2_OPTIMIZED": True,
+    "STREAM_READ_TIMEOUT": 120,              # Increased
+    "WRITE_BUFFER_SIZE": 256 * 1024,
+    "USE_NEON_OPTIMIZATIONS": True,
+    "CACHE_SIZE": 2097152,
+    "STREAM_TIMEOUT": 120,
+    "HLS_TIMEOUT": 90,
+    "HTTP_TIMEOUT": 60,
+    "HLS_SEGMENT_THREADS": 4,                # Reduced for less CPU
+    "STREAM_SEGMENT_THREADS": 4,             # Reduced for less CPU
+    "HLS_LIVE_EDGE": 5,                      # Increased for better stability
+    "HLS_SEGMENT_ATTEMPTS": 5,
+    "STREAM_SEGMENT_ATTEMPTS": 5,
+    "HLS_PLAYLIST_RELOAD_ATTEMPTS": 10,
+    "HLS_PLAYLIST_RELOAD_TIME": "3.0",
+    "HLS_SEGMENT_TIMEOUT": 20,
+    "DASH_SEGMENT_THREADS": 4,
+    "DASH_SEGMENT_ATTEMPTS": 3,
+    "DASH_SEGMENT_TIMEOUT": 20,
+    "FHD_BITRATE_THRESHOLD": 5000000,
+    "SOCKET_SNDBUF": 2097152,
+    "SOCKET_RCVBUF": 2097152,
+    "HTTP_POOL_CONNECTIONS": 30,
+    "HTTP_POOL_MAXSIZE": 30,
+    "PREFETCH_SEGMENTS": True,
+    "PREFETCH_COUNT": 3,
+    "ENABLE_PARALLEL_PARSING": False,        # Disabled - caused hickups
+}
+
+GLOBAL_STREAMLINK = None
+PLUGIN_CACHE = OrderedDict()
+API_CACHE = {}
+API_CACHE_TIMEOUT = 30
+
+_printable_re = re.compile(r"[{0}]".format(printable))
+_option_re = re.compile(r"""
+    (?P<name>[\w-]+)
+    \s*
+    (?P<op>=)?
+    \s*
+    (?P<value>.*)
+""", re.VERBOSE)
+DEFAULT_LEVEL = "info"
+
+PARALLEL_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
+
+def get_total_memory_mb():
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if 'MemTotal' in line:
+                    return int(line.split()[1]) // 1024
+    except:
+        pass
+    return 1024
+
+
+def get_gstreamer_version():
+    try:
+        import gi
+        gi.require_version('Gst', '1.0')
+        from gi.repository import Gst
+        Gst.init(None)
+        version = Gst.version_string()
+        match = re.search(r'(\d+\.\d+\.\d+)', version)
+        if match:
+            return match.group(1)
+        return version
+    except (ImportError, ValueError, Exception):
+        try:
+            result = subprocess.run(['gst-launch-1.0', '--version'],
+                                   capture_output=True, text=True, timeout=5)
+            if result.stdout:
+                match = re.search(r'(\d+\.\d+\.\d+)', result.stdout)
+                if match:
+                    return match.group(1)
+        except Exception:
+            pass
+        return "Unknown"
+
+def get_ffmpeg_version():
+    try:
+        result = subprocess.run(['ffmpeg', '-version'],
+                               capture_output=True, text=True, timeout=5)
+        if result.stdout:
+            match = re.search(r'ffmpeg version (\d+\.\d+\.\d+)', result.stdout)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+    return "Unknown"
+
+def get_system_versions():
+    return {
+        'gstreamer': get_gstreamer_version(),
+        'ffmpeg': get_ffmpeg_version()
+    }
+
+
+def set_loglevel(level):
+    global LOGLEVEL
+    if level:
+        LOGLEVEL = level
+        logger.root.setLevel(level)
+        LOGGER.setLevel(level)
+
+
+def is_fhd_stream(bitrate=None, stream_type=None, resolution=None):
+    """Detect if stream is FHD (1080p) or higher"""
+    if bitrate and bitrate > BUFFER_CONFIG["FHD_BITRATE_THRESHOLD"]:
+        return True
+    if stream_type in ("hls", "dash") and bitrate and bitrate > 4000000:
+        return True
+    return False
+
+
+def get_dynamic_buffer_config(stream_type=None, bitrate=None):
+    cfg = BUFFER_CONFIG.copy()
+    is_fhd = is_fhd_stream(bitrate, stream_type)
+
+    if is_fhd:
+        cfg["STREAM_CHUNK_SIZE"] = 768 * 1024
+        cfg["WRITE_BUFFER_SIZE"] = 512 * 1024
+        cfg["DEFAULT_PREBUFFER"] = 65536
+        cfg["STREAM_READ_TIMEOUT"] = 90
+        LOGGER.debug("FHD stream detected, using optimized buffers")
+    elif stream_type in ("hls", "dash"):
+        cfg["STREAM_CHUNK_SIZE"] = 256 * 1024
+        cfg["WRITE_BUFFER_SIZE"] = 128 * 1024
+        cfg["DEFAULT_PREBUFFER"] = 32768
+    elif stream_type in ("http", "rtmp"):
+        cfg["STREAM_CHUNK_SIZE"] = 512 * 1024
+        cfg["WRITE_BUFFER_SIZE"] = 256 * 1024
+        cfg["DEFAULT_PREBUFFER"] = 32768
+
+    if bitrate and bitrate > 8000000:
+        cfg["STREAM_CHUNK_SIZE"] = int(cfg["STREAM_CHUNK_SIZE"] * 1.5)
+        cfg["WRITE_BUFFER_SIZE"] = int(cfg["WRITE_BUFFER_SIZE"] * 1.5)
+        cfg["DEFAULT_PREBUFFER"] = int(cfg["DEFAULT_PREBUFFER"] * 1.5)
+
+    return cfg
+
+
+def apply_universal_stream_optimizations(stream, session=None):
+    """Apply universal optimizations to any stream object"""
+    if not session:
+        session = stream.session if hasattr(stream, 'session') else None
+    if not session:
+        return
+
+    # Set Chrome User Agent on session
+    try:
+        if hasattr(session, 'http') and hasattr(session.http, 'headers'):
+            session.http.headers.update({'User-Agent': DEFAULT_USER_AGENT})
+    except Exception:
+        pass
+
+    if isinstance(stream, HLSStream):
+        session.set_option("hls-live-edge", BUFFER_CONFIG["HLS_LIVE_EDGE"])
+        session.set_option("hls-segment-threads", BUFFER_CONFIG["HLS_SEGMENT_THREADS"])
+        session.set_option("hls-segment-attempts", BUFFER_CONFIG["HLS_SEGMENT_ATTEMPTS"])
+        session.set_option("hls-segment-timeout", BUFFER_CONFIG["HLS_SEGMENT_TIMEOUT"])
+        session.set_option("hls-playlist-reload-attempts", BUFFER_CONFIG["HLS_PLAYLIST_RELOAD_ATTEMPTS"])
+        session.set_option("hls-playlist-reload-time", BUFFER_CONFIG["HLS_PLAYLIST_RELOAD_TIME"])
+        session.set_option("hls-segment-stream-data", True)
+
+        if BUFFER_CONFIG["PREFETCH_SEGMENTS"]:
+            try:
+                if hasattr(stream, 'fetch_playlist'):
+                    stream.fetch_playlist()
+                    LOGGER.debug("HLS playlist prefetched")
+                if hasattr(stream, 'reader') and hasattr(stream.reader, 'prefetch'):
+                    stream.reader.prefetch(BUFFER_CONFIG["PREFETCH_COUNT"])
+                    LOGGER.debug("HLS segments prefetched: %d", BUFFER_CONFIG["PREFETCH_COUNT"])
+            except Exception as e:
+                LOGGER.debug("HLS prefetch skipped: %s", str(e))
+
+    elif isinstance(stream, DASHStream):
+        session.set_option("dash-segment-threads", BUFFER_CONFIG["DASH_SEGMENT_THREADS"])
+        session.set_option("dash-segment-attempts", BUFFER_CONFIG["DASH_SEGMENT_ATTEMPTS"])
+        session.set_option("dash-segment-timeout", BUFFER_CONFIG["DASH_SEGMENT_TIMEOUT"])
+
+        if BUFFER_CONFIG["PREFETCH_SEGMENTS"]:
+            try:
+                if hasattr(stream, 'fetch_manifest'):
+                    stream.fetch_manifest()
+                    LOGGER.debug("DASH manifest prefetched")
+            except Exception as e:
+                LOGGER.debug("DASH prefetch skipped: %s", str(e))
+
+    elif isinstance(stream, HTTPStream):
+        session.set_option("http-timeout", BUFFER_CONFIG["HTTP_TIMEOUT"])
+        session.set_option("stream-timeout", BUFFER_CONFIG["STREAM_TIMEOUT"])
+
+
+def parse_streams_parallel(streamlink, stream_objects):
+    """Parse multiple streams in parallel for faster startup"""
+    if not BUFFER_CONFIG["ENABLE_PARALLEL_PARSING"]:
+        return None
+
+    streams = {}
+
+    def parse_single(stream_type, url):
+        try:
+            if stream_type == "hls":
+                result = HLSStream.parse_variant_playlist(streamlink, url)
+                if result:
+                    for name, stream in result.items():
+                        apply_universal_stream_optimizations(stream, streamlink)
+                    return result
+            elif stream_type == "dash":
+                result = DASHStream.parse_manifest(streamlink, url)
+                if result:
+                    for name, stream in result.items():
+                        apply_universal_stream_optimizations(stream, streamlink)
+                    return result
+        except Exception as e:
+            LOGGER.debug(f"Parallel parse failed for {stream_type}: {e}")
+        return None
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        for stream_type, url in stream_objects:
+            if stream_type in ("hls", "dash"):
+                future = executor.submit(parse_single, stream_type, url)
+                futures.append(future)
+
+        for future in futures:
+            result = future.result(timeout=10)
+            if result:
+                streams.update(result)
+
+    return streams if streams else None
+
+
+class Streamlink2(Streamlink):
+    _loaded_plugins = None
+
+    def load_builtin_plugins(self):
+        if self.__class__._loaded_plugins is not None:
+            self._update_loaded_plugins()
+        else:
+            self.load_plugins(plugins.__path__[0])
+            if os.path.isdir(PLUGINS_DIR):
+                self.load_ext_plugins([PLUGINS_DIR])
+            self.__class__._loaded_plugins = self.plugins.copy()
+
+    def _update_loaded_plugins(self):
+        self.plugins = self.__class__._loaded_plugins.copy()
+        for plugin in self.plugins:
+            plugin.session = self
+
+    def load_ext_plugins(self, dirs):
+        dirs = [os.path.expanduser(d) for d in dirs]
+        for directory in dirs:
+            if os.path.isdir(directory):
+                self.load_plugins(directory)
+            else:
+                LOGGER.warning("Plugin path {0} does not exist or is not a directory!".format(directory))
+
+
+@contextmanager
+def ignored(*exceptions):
+    try:
+        yield
+    except exceptions:
+        pass
+
+
+def resolve_stream_name(streams, stream_name):
+    if stream_name in STREAM_SYNONYMS and stream_name in streams:
+        for name, stream in streams.items():
+            if stream is streams[stream_name] and name not in STREAM_SYNONYMS:
+                return name
+    return stream_name
+
+
+def format_valid_streams(plugin, streams):
+    delimiter = ", "
+    validstreams = []
+    for name, stream in sorted(streams.items(), key=lambda stream: plugin.stream_weight(stream[0])):
+        if name in STREAM_SYNONYMS:
+            continue
+        def synonymfilter(n):
+            return stream is streams[n] and n is not name
+        synonyms = list(filter(synonymfilter, streams.keys()))
+        if len(synonyms) > 0:
+            joined = delimiter.join(synonyms)
+            name = "{0} ({1})".format(name, joined)
+        validstreams.append(name)
+    return delimiter.join(validstreams)
+
+
+def optimize_stream(streamlink, args):
+    total_mem_mb = get_total_memory_mb()
+
+    # Set Chrome User Agent on session
+    try:
+        if hasattr(streamlink, 'http') and hasattr(streamlink.http, 'headers'):
+            streamlink.http.headers.update({'User-Agent': DEFAULT_USER_AGENT})
+    except Exception:
+        pass
+
+    streamlink.set_option("hls-segment-threads", BUFFER_CONFIG["HLS_SEGMENT_THREADS"])
+    streamlink.set_option("stream-segment-threads", BUFFER_CONFIG["STREAM_SEGMENT_THREADS"])
+    streamlink.set_option("hls-live-edge", BUFFER_CONFIG["HLS_LIVE_EDGE"])
+    streamlink.set_option("hls-segment-attempts", BUFFER_CONFIG["HLS_SEGMENT_ATTEMPTS"])
+    streamlink.set_option("stream-segment-attempts", BUFFER_CONFIG["STREAM_SEGMENT_ATTEMPTS"])
+    streamlink.set_option("hls-segment-timeout", BUFFER_CONFIG["HLS_SEGMENT_TIMEOUT"])
+    streamlink.set_option("hls-playlist-reload-attempts", BUFFER_CONFIG["HLS_PLAYLIST_RELOAD_ATTEMPTS"])
+    streamlink.set_option("hls-playlist-reload-time", BUFFER_CONFIG["HLS_PLAYLIST_RELOAD_TIME"])
+    streamlink.set_option("hls-segment-stream-data", True)
+
+    if total_mem_mb < 512:
+        streamlink.set_option("ringbuffer-size", 1024 * 1024)
+    else:
+        streamlink.set_option("ringbuffer-size", BUFFER_CONFIG["CACHE_SIZE"])
+
+    os.environ["STREAMLINK_NEON_OPT"] = "2"
+    os.environ["FFMPEG_NEON_OPT"] = "2"
+
+    streamlink.set_option("stream-timeout", BUFFER_CONFIG["STREAM_TIMEOUT"])
+    streamlink.set_option("hls-timeout", BUFFER_CONFIG["HLS_TIMEOUT"])
+    streamlink.set_option("http-timeout", BUFFER_CONFIG["HTTP_TIMEOUT"])
+
+    try:
+        streamlink.http.mount(
+            "http://",
+            HTTPAdapter(
+                pool_connections=BUFFER_CONFIG["HTTP_POOL_CONNECTIONS"],
+                pool_maxsize=BUFFER_CONFIG["HTTP_POOL_MAXSIZE"],
+                max_retries=0
+            )
+        )
+        streamlink.http.mount(
+            "https://",
+            HTTPAdapter(
+                pool_connections=BUFFER_CONFIG["HTTP_POOL_CONNECTIONS"],
+                pool_maxsize=BUFFER_CONFIG["HTTP_POOL_MAXSIZE"],
+                max_retries=0
+            )
+        )
+    except Exception:
+        pass
+
+    LOGGER.debug("DM920 optimizations: threads=%d, NEON=enabled, timeouts=%d/%d/%d",
+                 BUFFER_CONFIG["HLS_SEGMENT_THREADS"], BUFFER_CONFIG["STREAM_TIMEOUT"],
+                 BUFFER_CONFIG["HLS_TIMEOUT"], BUFFER_CONFIG["HTTP_TIMEOUT"])
+
+
+def test_stream(plugin, args, stream):
+    prebuffer = None
+    retry_open = args.retry_open if hasattr(args, 'retry_open') else BUFFER_CONFIG["MAX_RETRIES"]
+
+    apply_universal_stream_optimizations(stream)
+
+    for i in range(retry_open):
+        stream_fd = None
+        try:
+            stream_fd = stream.open()
+            try:
+                stream_type = type(stream).shortname()
+            except Exception:
+                stream_type = None
+
+            bitrate = getattr(stream, "bitrate", None)
+            is_fhd = is_fhd_stream(bitrate, stream_type)
+
+            # Ultimate prebuffer settings
+            if is_fhd:
+                prebuffer_size = 65536
+            else:
+                prebuffer_size = BUFFER_CONFIG["DEFAULT_PREBUFFER"]
+                if stream_type in ("hls", "dash"):
+                    prebuffer_size = 32768
+                elif stream_type in ("http", "rtmp"):
+                    prebuffer_size = 65536
+
+            if bitrate and bitrate > 8000000:
+                prebuffer_size = int(prebuffer_size * 1.5)
+
+            prebuffer_size = max(16384, min(prebuffer_size, 131072))
+            LOGGER.debug("Pre-buffering %d bytes (%s, FHD=%s)", prebuffer_size, stream_type, is_fhd)
+            prebuffer = stream_fd.read(prebuffer_size)
+            if prebuffer:
+                return stream_fd, prebuffer
+        except StreamError as err:
+            LOGGER.error("Try %d/%d: Could not open stream %s (%s)", i + 1, retry_open, stream, err)
+        except IOError as err:
+            LOGGER.error("Failed to read data from stream: %s", err)
+        finally:
+            if stream_fd and not prebuffer:
+                stream_fd.close()
+        if i < retry_open - 1:
+            time.sleep(BUFFER_CONFIG["RETRY_DELAY"])
+    LOGGER.error("No data returned from stream")
+    return None, None
+
+
+def log_current_arguments(streamlink, args, url, quality):
+    global PARSER, LOGGER
+    if not logger.root.isEnabledFor(logging.DEBUG):
+        return
+    sensitive = set()
+    for pname, plugin in streamlink.plugins.get_loaded().items():
+        for parg in plugin.arguments or []:
+            if parg.sensitive:
+                sensitive.add(parg.argument_name(pname))
+    LOGGER.debug("Arguments:")
+    LOGGER.debug(" url=%s", url)
+    LOGGER.debug(" stream=%s", quality.split(","))
+    for action in PARSER._actions:
+        if not hasattr(args, action.dest):
+            continue
+        value = getattr(args, action.dest)
+        if action.default != value:
+            name = next((option for option in action.option_strings if option.startswith("--")), action.option_strings[0]) if action.option_strings else action.dest
+            LOGGER.debug(" %s=%s", name, value if name not in sensitive else '*' * 8)
+
+
+def sendHeaders(http, status=200, type="video/mp4", content_length=None):
+    http.send_response(status)
+    http.send_header("Server", "Streamlink/{}".format(__version__))
+    http.send_header("Content-type", type)
+    if content_length is not None:
+        http.send_header("Content-Length", str(content_length))
+    http.send_header("Connection", "close")
+    http.send_header("Cache-Control", "no-cache")
+    http.send_header("Keep-Alive", "timeout=5, max=100")
+    http.end_headers()
+
+
+def sendOfflineMP4(http, send_headers=True):
+    LOGGER.debug("Send Offline clip")
+    try:
+        if send_headers:
+            sendHeaders(http, type="video/mp4")
+        offline_path = "/usr/share/offline.mp4"
+        if os.path.exists(offline_path):
+            with open(offline_path, "rb") as f:
+                shutil.copyfileobj(f, http.wfile, 65536)
+        else:
+            black_frame = b'\x00\x00\x00\x1cftypmp4\x00\x00\x00\x00mp4isom\x00\x00\x00\x08free\x00\x00\x03\x18mdat'
+            http.wfile.write(black_frame)
+    except (BrokenPipeError, socket.error):
+        LOGGER.info("Client disconnected while sending offline clip")
+
+
+def stream_to_url(stream):
+    try:
+        return stream.to_url()
+    except TypeError:
+        return None
+
+
+def parse_service_reference(path):
+    if re.match(r'^[0-9]+:', path):
+        parts = path.split(':')
+        if len(parts) >= 11:
+            for i, part in enumerate(parts):
+                if 'http' in part or 'https' in part:
+                    return unquote(part)
+            last_part = parts[-1]
+            if '%3A' in last_part or '%2F' in last_part:
+                return unquote(last_part)
+    return path
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        self.NESTED_ARGUMENT_GROUPS = {}
+        super().__init__(*args, **kwargs)
+
+    def add_argument_group(self, *args, parent=None, **kwargs):
+        group = super().add_argument_group(*args, **kwargs)
+        if parent not in self.NESTED_ARGUMENT_GROUPS:
+            self.NESTED_ARGUMENT_GROUPS[parent] = [group]
+        else:
+            self.NESTED_ARGUMENT_GROUPS[parent].append(group)
+        return group
+
+    def convert_arg_line_to_args(self, line):
+        match = _printable_re.search(line)
+        if not match:
+            return
+        line = line[match.start():].strip()
+        option = _option_re.match(line)
+        if not option:
+            return
+        name, value = option.group("name", "value")
+        if name and value:
+            yield "--{0}={1}".format(name, value)
+        elif name:
+            yield "--{0}".format(name)
+
+    def error(self, message):
+        LOGGER.error(message)
+
+
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def __init__(self, max_help_position=4, *args, **kwargs):
+        kwargs["max_help_position"] = max_help_position
+        argparse.RawDescriptionHelpFormatter.__init__(self, *args, **kwargs)
+
+    def _split_lines(self, text, width):
+        text = dedent(text).strip() + "\n\n"
+        return text.splitlines()
+
+
+def build_parser():
+    global PARSER
+    PARSER = ArgumentParser(
+        fromfile_prefix_chars="@",
+        formatter_class=HelpFormatter,
+        add_help=False,
+        usage="%(prog)s [OPTIONS] <URL> [STREAM]",
+        description=dedent("""
+        Streamlink Daemon for DM920
+        Universal optimizations for all plugins
+        """),
+        epilog=dedent("""
+        Features:
+        - Universal stream optimizations
+        - Parallel stream parsing
+        - Prefetch support
+        - NEON SIMD optimizations for Cortex-A15
+        - Dual-core scheduling
+        - Hardcoded for DM920 (no detection overhead)
+        - Universal timeouts for all connections
+        - FHD optimized buffer settings
+        """)
+    )
+    general = PARSER.add_argument_group("General options")
+    general.add_argument("-h", "--help", action="store_true")
+    general.add_argument("--locale", type=str, metavar="LOCALE")
+    general.add_argument("-l", "--loglevel", metavar="LEVEL", choices=logger.levels, default=DEFAULT_LEVEL)
+    general.add_argument("--logfile", metavar="FILE")
+    general.add_argument("--interface", type=str, metavar="INTERFACE")
+    general.add_argument("-4", "--ipv4", action="store_true")
+    general.add_argument("-6", "--ipv6", action="store_true")
+    player = PARSER.add_argument_group("Player options")
+    player.add_argument("--player-passthrough", metavar="TYPES", type=comma_list_filter(STREAM_PASSTHROUGH), default=[])
+    player.add_argument("--stream-passthrough-encrypted", action="store_true", help="Pass through encrypted HLS/DASH segments")
+    http = PARSER.add_argument_group("HTTP options")
+    http.add_argument("--http-proxy", metavar="HTTP_PROXY")
+    http.add_argument("--https-proxy", metavar="HTTPS_PROXY")
+    http.add_argument("--http-cookie", metavar="KEY=VALUE", type=keyvalue, action="append")
+    http.add_argument("--http-header", metavar="KEY=VALUE", type=keyvalue, action="append")
+    http.add_argument("--http-query-param", metavar="KEY=VALUE", type=keyvalue, action="append")
+    http.add_argument("--http-ignore-env", action="store_true")
+    http.add_argument("--http-no-ssl-verify", action="store_true")
+    http.add_argument("--http-disable-dh", action="store_true")
+    http.add_argument("--http-ssl-cert", metavar="FILENAME")
+    http.add_argument("--http-ssl-cert-crt-key", metavar=("CRT_FILENAME", "KEY_FILENAME"), nargs=2)
+    http.add_argument("--http-timeout", metavar="TIMEOUT", type=num(float, gt=0))
+    transport = PARSER.add_argument_group("Stream transport options")
+    transport.add_argument("--hds-live-edge", type=num(float, gt=0), metavar="SECONDS")
+    transport.add_argument("--hds-segment-attempts", help=argparse.SUPPRESS)
+    transport.add_argument("--hds-segment-threads", help=argparse.SUPPRESS)
+    transport.add_argument("--hds-segment-timeout", help=argparse.SUPPRESS)
+    transport.add_argument("--hds-timeout", help=argparse.SUPPRESS)
+    transport.add_argument("--hls-live-edge", type=num(int, ge=1), metavar="SEGMENTS")
+    transport.add_argument("--hls-segment-stream-data", action="store_true", help=argparse.SUPPRESS)
+    transport.add_argument("--hls-playlist-reload-attempts", type=num(int, ge=1), metavar="ATTEMPTS")
+    transport.add_argument("--hls-playlist-reload-time", metavar="TIME")
+    transport.add_argument("--hls-segment-attempts", help=argparse.SUPPRESS)
+    transport.add_argument("--hls-segment-threads", help=argparse.SUPPRESS)
+    transport.add_argument("--hls-segment-timeout", help=argparse.SUPPRESS)
+    transport.add_argument("--hls-segment-ignore-names", metavar="NAMES", type=comma_list)
+    transport.add_argument("--hls-segment-key-uri", metavar="URI", type=str)
+    transport.add_argument("--hls-audio-select", type=comma_list, metavar="CODE")
+    transport.add_argument("--hls-timeout", help=argparse.SUPPRESS)
+    transport.add_argument("--hls-start-offset", type=hours_minutes_seconds_float, metavar="[[XX:]XX:]XX[.XX] | [XXh][XXm][XX[.XX]s]")
+    transport.add_argument("--hls-duration", type=hours_minutes_seconds_float, metavar="[[XX:]XX:]XX[.XX] | [XXh][XXm][XX[.XX]s]")
+    transport.add_argument("--hls-live-restart", action="store_true")
+    transport.add_argument("--http-add-audio", metavar="URL")
+    transport.add_argument("--http-stream-timeout", help=argparse.SUPPRESS)
+    transport.add_argument("--ringbuffer-size", metavar="SIZE", type=filesize, default=BUFFER_CONFIG["CACHE_SIZE"])
+    transport.add_argument("--rtmp-proxy", metavar="PROXY")
+    transport.add_argument("--rtmp-rtmpdump", metavar="FILENAME")
+    transport.add_argument("--rtmpdump", help=argparse.SUPPRESS)
+    transport.add_argument("--rtmp-timeout", help=argparse.SUPPRESS)
+    transport.add_argument("--stream-segment-attempts", type=num(int, ge=1), metavar="ATTEMPTS")
+    transport.add_argument("--stream-segment-threads", type=num(int, ge=1, le=10), metavar="THREADS")
+    transport.add_argument("--stream-segment-timeout", type=num(float, gt=0), metavar="TIMEOUT")
+    transport.add_argument("--stream-timeout", type=num(float, gt=0), metavar="TIMEOUT")
+    transport.add_argument("--subprocess-errorlog", action="store_true")
+    transport.add_argument("--subprocess-errorlog-path", type=str, metavar="PATH")
+    transport.add_argument("--ffmpeg-ffmpeg", metavar="FILENAME")
+    transport.add_argument("--ffmpeg-verbose", action="store_true")
+    transport.add_argument("--ffmpeg-verbose-path", type=str, metavar="PATH")
+    transport.add_argument("--ffmpeg-fout", type=str, metavar="OUTFORMAT")
+    transport.add_argument("--ffmpeg-video-transcode", metavar="CODEC")
+    transport.add_argument("--ffmpeg-audio-transcode", metavar="CODEC")
+    transport.add_argument("--ffmpeg-copyts", action="store_true")
+    transport.add_argument("--ffmpeg-start-at-zero", action="store_true")
+    transport.add_argument("--mux-subtitles", action="store_true")
+    stream = PARSER.add_argument_group("Stream options")
+    stream.add_argument("--default-stream", type=comma_list, metavar="STREAM")
+    stream.add_argument("--stream-types", "--stream-priority", metavar="TYPES", type=comma_list)
+    stream.add_argument("--stream-sorting-excludes", metavar="STREAMS", type=comma_list)
+    stream.add_argument("--retry-open", metavar="ATTEMPTS", type=num(int, ge=1), default=BUFFER_CONFIG["MAX_RETRIES"])
+    return PARSER
+
+
+def setupTransportOpts(streamlink, args):
+    if args.interface:
+        streamlink.set_option("interface", args.interface)
+    if args.ipv4:
+        streamlink.set_option("ipv4", args.ipv4)
+    if args.ipv6:
+        streamlink.set_option("ipv6", args.ipv6)
+    if args.hls_live_edge:
+        streamlink.set_option("hls-live-edge", args.hls_live_edge)
+    if args.hls_playlist_reload_attempts:
+        streamlink.set_option("hls-playlist-reload-attempts", args.hls_playlist_reload_attempts)
+    if args.hls_playlist_reload_time:
+        streamlink.set_option("hls-playlist-reload-time", args.hls_playlist_reload_time)
+    if args.hls_segment_ignore_names:
+        streamlink.set_option("hls-segment-ignore-names", args.hls_segment_ignore_names)
+    if args.hls_segment_key_uri:
+        streamlink.set_option("hls-segment-key-uri", args.hls_segment_key_uri)
+    if args.hls_audio_select:
+        streamlink.set_option("hls-audio-select", args.hls_audio_select)
+    if args.hls_start_offset:
+        streamlink.set_option("hls-start-offset", args.hls_start_offset)
+    if args.hls_duration:
+        streamlink.set_option("hls-duration", args.hls_duration)
+    if args.hls_live_restart:
+        streamlink.set_option("hls-live-restart", args.hls_live_restart)
+    if args.hds_live_edge:
+        streamlink.set_option("hds-live-edge", args.hds_live_edge)
+    if args.http_add_audio:
+        streamlink.set_option("http-add-audio", args.http_add_audio)
+    if args.ringbuffer_size:
+        streamlink.set_option("ringbuffer-size", args.ringbuffer_size)
+    if args.rtmp_proxy:
+        streamlink.set_option("rtmp-proxy", args.rtmp_proxy)
+    if args.rtmp_rtmpdump:
+        streamlink.set_option("rtmp-rtmpdump", args.rtmp_rtmpdump)
+    elif args.rtmpdump:
+        streamlink.set_option("rtmp-rtmpdump", args.rtmpdump)
+    if hasattr(args, 'hds_segment_attempts') and args.hds_segment_attempts:
+        streamlink.set_option("hds-segment-attempts", args.hds_segment_attempts)
+    if hasattr(args, 'hds_segment_threads') and args.hds_segment_threads:
+        streamlink.set_option("hds-segment-threads", args.hds_segment_threads)
+    if hasattr(args, 'hds_segment_timeout') and args.hds_segment_timeout:
+        streamlink.set_option("hds-segment-timeout", args.hds_segment_timeout)
+    if hasattr(args, 'hds_timeout') and args.hds_timeout:
+        streamlink.set_option("hds-timeout", args.hds_timeout)
+    if hasattr(args, 'hls_segment_attempts') and args.hls_segment_attempts:
+        streamlink.set_option("hls-segment-attempts", args.hls_segment_attempts)
+    if hasattr(args, 'hls_segment_threads') and args.hls_segment_threads:
+        streamlink.set_option("hls-segment-threads", args.hls_segment_threads)
+    if hasattr(args, 'hls_segment_timeout') and args.hls_segment_timeout:
+        streamlink.set_option("hls-segment-timeout", args.hls_segment_timeout)
+    if hasattr(args, 'hls_timeout') and args.hls_timeout:
+        streamlink.set_option("hls-timeout", args.hls_timeout)
+    if hasattr(args, 'http_stream_timeout') and args.http_stream_timeout:
+        streamlink.set_option("http-stream-timeout", args.http_stream_timeout)
+    if hasattr(args, 'rtmp_timeout') and args.rtmp_timeout:
+        streamlink.set_option("rtmp-timeout", args.rtmp_timeout)
+    if args.stream_segment_attempts:
+        streamlink.set_option("stream-segment-attempts", args.stream_segment_attempts)
+    if args.stream_segment_threads:
+        streamlink.set_option("stream-segment-threads", args.stream_segment_threads)
+    if args.stream_segment_timeout:
+        streamlink.set_option("stream-segment-timeout", args.stream_segment_timeout)
+    if args.stream_timeout:
+        streamlink.set_option("stream-timeout", args.stream_timeout)
+    if args.ffmpeg_ffmpeg:
+        streamlink.set_option("ffmpeg-ffmpeg", args.ffmpeg_ffmpeg)
+    if args.ffmpeg_verbose:
+        streamlink.set_option("ffmpeg-verbose", args.ffmpeg_verbose)
+    if args.ffmpeg_verbose_path:
+        streamlink.set_option("ffmpeg-verbose-path", args.ffmpeg_verbose_path)
+    if args.ffmpeg_fout:
+        fmt_map = {"mpegts": "mpegts", "matroska": "matroska", "mp4": "mp4"}
+        streamlink.set_option("ffmpeg-fout", fmt_map.get(args.ffmpeg_fout, args.ffmpeg_fout))
+    if args.ffmpeg_video_transcode:
+        streamlink.set_option("ffmpeg-video-transcode", args.ffmpeg_video_transcode)
+    if args.ffmpeg_audio_transcode:
+        streamlink.set_option("ffmpeg-audio-transcode", args.ffmpeg_audio_transcode)
+    if args.ffmpeg_copyts:
+        streamlink.set_option("ffmpeg-copyts", True)
+    if args.ffmpeg_start_at_zero:
+        streamlink.set_option("ffmpeg-start-at-zero", False)
+    if args.mux_subtitles:
+        streamlink.set_option("mux-subtitles", args.mux_subtitles)
+    streamlink.set_option("subprocess-errorlog", args.subprocess_errorlog)
+    streamlink.set_option("subprocess-errorlog-path", args.subprocess_errorlog_path)
+    streamlink.set_option("locale", args.locale)
+
+
+def setupHttpSession(streamlink, args):
+    # Set Chrome User Agent
+    try:
+        if hasattr(streamlink, 'http') and hasattr(streamlink.http, 'headers'):
+            streamlink.http.headers.update({'User-Agent': DEFAULT_USER_AGENT})
+    except Exception:
+        pass
+
+    if args.http_proxy:
+        streamlink.set_option("http-proxy", args.http_proxy)
+    cookie_file = os.path.expanduser(XDG_CONFIG_HOME + "/streamlink/cookies.txt")
+    if not args.http_cookie and os.path.isfile(cookie_file):
+        try:
+            streamlink.set_option("http-cookie-file", cookie_file)
+            LOGGER.info("Auto-loaded cookie file: %s", cookie_file)
+        except Exception:
+            pass
+    if args.https_proxy:
+        streamlink.set_option("https-proxy", args.https_proxy)
+    if args.http_cookie:
+        streamlink.set_option("http-cookies", dict(args.http_cookie))
+    if args.http_header:
+        streamlink.set_option("http-headers", dict(args.http_header))
+    if args.http_query_param:
+        streamlink.set_option("http-query-params", dict(args.http_query_param))
+    if args.http_ignore_env:
+        streamlink.set_option("http-trust-env", False)
+    if args.http_no_ssl_verify:
+        streamlink.set_option("http-ssl-verify", False)
+    if args.http_disable_dh:
+        streamlink.set_option("http-disable-dh", True)
+    if args.http_ssl_cert:
+        streamlink.set_option("http-ssl-cert", args.http_ssl_cert)
+    if args.http_ssl_cert_crt_key:
+        streamlink.set_option("http-ssl-cert", tuple(args.http_ssl_cert_crt_key))
+    if args.http_timeout:
+        streamlink.set_option("http-timeout", args.http_timeout)
+
+
+def setup_plugin_args(streamlink):
+    plugin_args = PARSER.add_argument_group("Plugin options")
+    for pname, plugin in streamlink.plugins.get_loaded().items():
+        group = PARSER.add_argument_group(pname.capitalize(), parent=plugin_args)
+        for parg in plugin.arguments or []:
+            group.add_argument(parg.argument_name(pname), **parg.options)
+    return True
+
+
+def setup_plugin_options(streamlink, plugin, args, pluginname):
+    if not plugin.arguments:
+        return Options()
+    defaults = {}
+    values = {}
+    required = {}
+    for parg in plugin.arguments:
+        defaults[parg.dest] = parg.default
+        if parg.options.get("help") == argparse.SUPPRESS:
+            continue
+        value = getattr(args, parg.namespace_dest(pluginname))
+        values[parg.dest] = value
+        if parg.required:
+            required[parg.name] = parg
+        if parg.required or value:
+            try:
+                for rparg in plugin.arguments.requires(parg.name):
+                    required[rparg.name] = rparg
+            except RuntimeError:
+                PARSER.error(f"{pluginname} plugin has a configuration error")
+                break
+    options = Options(defaults)
+    options.update(values)
+    return options
+
+
+def setup_config_files(streamlink, url):
+    config_files = []
+    pluginclass = None
+    resolved_url = None
+    pluginname = None
+    if url:
+        with ignored(NoPluginError):
+            pluginname, pluginclass, resolved_url = streamlink.resolve_url(url)
+            config_files += ["{0}.{1}".format(fn, pluginname) for fn in CONFIG_FILES]
+    for config_file in filter(os.path.isfile, CONFIG_FILES):
+        config_files.append(config_file)
+        break
+    if pluginclass and resolved_url:
+        return (config_files, pluginclass(streamlink, resolved_url), pluginname)
+    return (config_files, None, pluginname)
+
+
+def setup_args(arglist, config_files=[], ignore_unknown=False):
+    for config_file in filter(os.path.isfile, config_files):
+        arglist.insert(0, "@" + config_file)
+    args, unknown = PARSER.parse_known_args(arglist)
+    if unknown and not ignore_unknown:
+        PARSER.error("unrecognized arguments: {0}".format(' '.join(unknown)))
+    return args
+
+
+def create_fresh_streamlink_session():
+    session = Streamlink2()
+
+    # Set Chrome User Agent on session
+    try:
+        if hasattr(session, 'http') and hasattr(session.http, 'headers'):
+            session.http.headers.update({'User-Agent': DEFAULT_USER_AGENT})
+    except Exception:
+        pass
+
+    try:
+        session.http.mount(
+            "http://",
+            HTTPAdapter(
+                pool_connections=BUFFER_CONFIG["HTTP_POOL_CONNECTIONS"],
+                pool_maxsize=BUFFER_CONFIG["HTTP_POOL_MAXSIZE"],
+                max_retries=0
+            )
+        )
+        session.http.mount(
+            "https://",
+            HTTPAdapter(
+                pool_connections=BUFFER_CONFIG["HTTP_POOL_CONNECTIONS"],
+                pool_maxsize=BUFFER_CONFIG["HTTP_POOL_MAXSIZE"],
+                max_retries=0
+            )
+        )
+    except Exception:
+        pass
+
+    session.set_option("hls-live-edge", BUFFER_CONFIG["HLS_LIVE_EDGE"])
+    session.set_option("hls-segment-threads", BUFFER_CONFIG["HLS_SEGMENT_THREADS"])
+    session.set_option("stream-segment-threads", BUFFER_CONFIG["STREAM_SEGMENT_THREADS"])
+    session.set_option("hls-segment-attempts", BUFFER_CONFIG["HLS_SEGMENT_ATTEMPTS"])
+    session.set_option("hls-segment-timeout", BUFFER_CONFIG["HLS_SEGMENT_TIMEOUT"])
+    session.set_option("hls-playlist-reload-attempts", BUFFER_CONFIG["HLS_PLAYLIST_RELOAD_ATTEMPTS"])
+    session.set_option("hls-playlist-reload-time", BUFFER_CONFIG["HLS_PLAYLIST_RELOAD_TIME"])
+    session.set_option("ringbuffer-size", BUFFER_CONFIG["CACHE_SIZE"])
+    session.set_option("stream-timeout", BUFFER_CONFIG["STREAM_TIMEOUT"])
+    session.set_option("hls-segment-stream-data", True)
+    return session
+
+
+def Stream(streamlink, http, url, argstr, quality):
+    global PARSER, _loglevel, PLUGIN_ARGS
+    fd = None
+    not_stream_opened = True
+    plugin = None
+    pluginname = ""
+    stream_name = None
+    requested_streams = []
+    try:
+        args = None
+        if PARSER:
+            if not PLUGIN_ARGS:
+                PLUGIN_ARGS = setup_plugin_args(streamlink)
+            config_files, plugin, pluginname = setup_config_files(streamlink, url)
+            if config_files or argstr:
+                arglist = argsplit(argstr[0]) if argstr and argstr[0] else []
+                try:
+                    args = setup_args(arglist, config_files=config_files, ignore_unknown=False)
+                    class SafeNamespace(argparse.Namespace):
+                        def __getattr__(self, name):
+                            return None
+                    args = SafeNamespace(**vars(args))
+                except Exception as e:
+                    LOGGER.error("Argument parsing error: %s", str(e))
+                    return sendOfflineMP4(http, send_headers=not_stream_opened)
+                else:
+                    set_loglevel(args.loglevel)
+                    setupHttpSession(streamlink, args)
+                    setupTransportOpts(streamlink, args)
+                    optimize_stream(streamlink, args)
+        if not plugin:
+            cache = PLUGIN_CACHE.get(url)
+
+            if cache:
+                pluginname, pluginclass, resolved_url = cache
+            else:
+                pluginname, pluginclass, resolved_url = \
+                    streamlink.resolve_url(url)
+
+                if len(PLUGIN_CACHE) >= 512:
+                    PLUGIN_CACHE.popitem(last=False)
+
+                PLUGIN_CACHE[url] = (
+                    pluginname,
+                    pluginclass,
+                    resolved_url
+                )
+            plugin = pluginclass(streamlink, resolved_url)
+        if PARSER and PLUGIN_ARGS and args:
+            setup_plugin_options(streamlink, plugin, args, pluginname)
+            log_current_arguments(streamlink, args, url, quality)
+        LOGGER.info("Found plugin %s for URL %s", pluginname, url)
+        if args:
+            streams = plugin.streams(stream_types=args.stream_types, sorting_excludes=args.stream_sorting_excludes)
+        else:
+            streams = plugin.streams()
+        if not streams:
+            LOGGER.error("No playable streams found for URL: %s", url)
+            return sendOfflineMP4(http, send_headers=not_stream_opened)
+        LOGGER.info("Available streams: %s", format_valid_streams(plugin, streams))
+        stream = None
+        requested_streams = [resolve_stream_name(streams, s.strip()) for s in quality.split(',')]
+        for stream_name_candidate in requested_streams:
+            if stream_name_candidate in streams:
+                stream = True
+                stream_name = stream_name_candidate
+                break
+        if not stream:
+            if "best" in streams:
+                stream_name = "best"
+                LOGGER.info("Stream '%s' not found, using 'best'", quality)
+            else:
+                LOGGER.error("Stream '%s' not found", quality)
+                return sendOfflineMP4(http, send_headers=not_stream_opened)
+        if stream_name and not stream_name.endswith("_alt") and stream_name not in STREAM_SYNONYMS:
+            prefix = stream_name
+            alt_streams = [k for k in sorted(streams.keys()) if k.startswith(prefix) and "_alt" in k]
+        else:
+            alt_streams = []
+        if args and args.http_add_audio:
+            http_add_audio = HTTPStream(streamlink, args.http_add_audio)
+        else:
+            http_add_audio = False
+        prebuffer = None
+        stream_names = [stream_name] + alt_streams if stream_name else []
+        dyn_cfg = BUFFER_CONFIG.copy()
+        for current_stream_name in stream_names:
+            stream = streams[current_stream_name]
+            stream_type = type(stream).shortname()
+            bitrate = getattr(stream, "bitrate", None)
+            dyn_cfg = get_dynamic_buffer_config(stream_type, bitrate)
+
+            apply_universal_stream_optimizations(stream, streamlink)
+
+            if is_fhd_stream(bitrate, stream_type):
+                LOGGER.info("FHD stream detected: %s (bitrate: %s)", current_stream_name, bitrate)
+
+            if http_add_audio and stream_type in ("hls", "http", "rtmp"):
+                stream = MuxedStream(streamlink, stream, http_add_audio, add_audio=True,
+                                    copyts=args.ffmpeg_copyts if args else True,
+                                    start_at_zero=args.ffmpeg_start_at_zero if args else False)
+                stream_type = "muxed-stream"
+            player_passthrough = stream_type == "hls" and hasattr(plugin, 'module') and plugin.module == "youtube"
+            if args and ((stream_type in args.player_passthrough or player_passthrough) or
+                        (hasattr(args, 'stream_passthrough_encrypted') and args.stream_passthrough_encrypted)):
+                stream_url = stream_to_url(stream)
+                LOGGER.debug("301 Passthrough - URL: %s", stream_url)
+                try:
+                    http.send_response(301)
+                    http.send_header("Location", stream_url)
+                    http.send_header("Content-Length", "0")
+                    http.send_header("Connection", "close")
+                    http.end_headers()
+                except (BrokenPipeError, socket.error):
+                    LOGGER.info("Client disconnected during redirect")
+                return
+            fd, prebuffer = test_stream(plugin, args, stream)
+            if prebuffer:
+                break
+        if not prebuffer:
+            retry_count = args.retry_open if args and hasattr(args, 'retry_open') else BUFFER_CONFIG["MAX_RETRIES"]
+            raise StreamError("Could not open stream after %d attempts" % retry_count)
+        LOGGER.debug("Writing stream to player")
+        not_stream_opened = False
+        sendHeaders(http)
+        try:
+            http.wfile.write(prebuffer)
+        except (BrokenPipeError, socket.error):
+            LOGGER.info("Client disconnected during prebuffer")
+            return
+        flush_counter = 0
+        chunk_size = dyn_cfg["STREAM_CHUNK_SIZE"]
+        stream_timeout = dyn_cfg.get("STREAM_READ_TIMEOUT", 60)
+        LOGGER.debug("Chunk size: %d bytes, timeout: %d seconds", chunk_size, stream_timeout)
+        sock = getattr(fd, "socket", None)
+        if sock:
+            try:
+                sock.settimeout(stream_timeout)
+            except Exception as e:
+                LOGGER.debug("Socket timeout not set: %s", str(e))
+        consecutive_timeouts = 0
+        last_activity = time.time()
+        flush_threshold = max(16, 2097152 // chunk_size)
+        while True:
+            try:
+                data = fd.read(chunk_size)
+                if data:
+                    consecutive_timeouts = 0
+                    last_activity = time.time()
+                else:
+                    break
+            except socket.timeout:
+                consecutive_timeouts += 1
+                LOGGER.warning("Stream timeout (%d/8)", consecutive_timeouts)
+                if consecutive_timeouts >= 8:
+                    LOGGER.error("Stream frozen, aborting")
+                    break
+                continue
+            except (IOError, OSError) as e:
+                if "timeout" in str(e).lower():
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts >= 8:
+                        break
+                    continue
+                LOGGER.warning("Read error: %s", str(e))
+                break
+            except Exception as e:
+                LOGGER.warning("Read error: %s", str(e))
+                break
+            if time.time() - last_activity > 90:
+                LOGGER.warning("No data received for 90 seconds, aborting")
+                break
+            try:
+                http.wfile.write(data)
+                flush_counter += 1
+                if flush_counter >= flush_threshold:
+                    try:
+                        http.wfile.flush()
+                    except (BrokenPipeError, socket.error, OSError):
+                        LOGGER.info("Player disconnected")
+                        break
+                    flush_counter = 0
+            except (BrokenPipeError, socket.error, OSError):
+                LOGGER.info("Player disconnected")
+                break
+    except NoPluginError:
+        LOGGER.error("No plugin for URL: %s", url)
+        sendOfflineMP4(http, send_headers=not_stream_opened)
+    except (PluginError, FatalPluginError, StreamError, NoStreamsError) as err:
+        error_str = str(err).lower()
+        if "validationerror" not in error_str and "xml_find" not in error_str:
+            LOGGER.error(str(err))
+        else:
+            LOGGER.debug("Stream unavailable: %s", str(err)[:100])
+        sendOfflineMP4(http, send_headers=not_stream_opened)
+    except socket.error as err:
+        if err.errno != errno.EPIPE:
+            LOGGER.error("Socket error: %s", str(err))
+        else:
+            LOGGER.info("Player disconnected")
+    except Exception as err:
+        if not_stream_opened and LOGLEVEL not in ("debug", "trace"):
+            LOGGER.error("Exception: %s", str(err))
+        else:
+            LOGGER.error("Exception: %s\n%s", str(err), traceback.format_exc())
+        sendOfflineMP4(http, send_headers=not_stream_opened)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if fd is not None:
+            try:
+                fd.close()
+            except Exception:
+                pass
+        if plugin and hasattr(plugin, 'close'):
+            try:
+                plugin.close()
+            except Exception:
+                pass
+        if hasattr(streamlink, 'plugins'):
+            streamlink.plugins.clear()
+        stream = None
+        streams = None
+        plugin = None
+        try:
+            if len(gc.get_objects()) > 100000:
+                gc.collect()
+        except Exception:
+            pass
+
+
+class StreamHandler(BaseHTTPRequestHandler):
+    timeout = 60
+
+    def validate_url(self, url):
+        if not url:
+            return False
+        if any(c in url for c in ['..', '\\', '\x00', '\r', '\n']):
+            LOGGER.warning("Blocked suspicious URL: %s", url)
+            return False
+        if url.startswith('file://') or url.startswith('//'):
+            LOGGER.warning("Blocked file:// or // URI: %s", url)
+            return False
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.scheme not in ['http', 'https']:
+            LOGGER.warning("Blocked non-http URL: %s", url)
+            return False
+        return True
+
+    def do_HEAD(s):
+        sendHeaders(s)
+
+    def do_GET(s):
+        try:
+            s.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_CONFIG["SOCKET_SNDBUF"])
+            s.connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_CONFIG["SOCKET_RCVBUF"])
+            s.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except Exception as e:
+            LOGGER.debug("Socket tuning skipped: %s", str(e))
+        try:
+            s.connection.settimeout(60)
+        except Exception:
+            pass
+        path = unquote(s.path[1:])
+        if re.match(r'^[0-9]+:', path):
+            path = parse_service_reference(path)
+        if not s.validate_url(path.split(' -', 1)[0].strip()):
+            s.send_response(400)
+            s.end_headers()
+            return
+        quality = "best"
+        if path.startswith("q=") and "/" in path:
+            i = path.index("/")
+            quality = path[2:i].replace(" ", "")
+            path = path[i + 1:]
+        url_parts = path.split(' -', 1)
+        url = url_parts[0].strip()
+        argstr = url_parts[1:2] if len(url_parts) > 1 else []
+        LOGGER.debug("Processing: %s [%s]", url, quality)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            streamlink = create_fresh_streamlink_session()
+        return Stream(streamlink, s, url, argstr, quality)
+
+    def finish(self, *args, **kw):
+        try:
+            if hasattr(self, 'wfile') and self.wfile and not getattr(self.wfile, 'closed', True):
+                try:
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                try:
+                    self.wfile.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            try:
+                if hasattr(self, 'rfile') and self.rfile:
+                    self.rfile.close()
+            except Exception:
+                pass
+            try:
+                super().finish()
+            except Exception:
+                pass
+
+    def handle(self):
+        try:
+            if hasattr(self, 'connection'):
+                try:
+                    self.connection.settimeout(self.timeout)
+                except Exception:
+                    pass
+            BaseHTTPRequestHandler.handle(self)
+        except socket.timeout:
+            LOGGER.debug("Connection timeout")
+        except (socket.error, OSError) as e:
+            if not (hasattr(e, 'errno') and e.errno in (errno.EPIPE, errno.ECONNRESET, errno.EBADF)):
+                LOGGER.debug("Socket error: %s", str(e))
+        except Exception as e:
+            LOGGER.debug("Handler error: %s", str(e))
+
+    def log_message(self, format, *args):
+        if LOGLEVEL in ("trace", "debug"):
+            LOGGER.debug(format % args)
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+    timeout = 60
+
+    def shutdown_request(self, request):
+        try:
+            request.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            request.close()
+        except OSError:
+            pass
+
+
+def start():
+    def setup_logging(stream=sys.stdout, level="info"):
+        fmt = ("[{asctime},{msecs:0.0f}]" if level == "trace" else "") + "[{name}][{levelname}] {message}"
+        logger.basicConfig(stream=stream, level=level, format=fmt, style="{", datefmt="%H:%M:%S")
+
+    def apply_global_loglevel():
+        logger.root.setLevel(LOGLEVEL)
+        LOGGER.setLevel(LOGLEVEL)
+
+    global LOGGER, PARSER, GLOBAL_STREAMLINK
+    setup_logging(level=LOGLEVEL)
+    apply_global_loglevel()
+    LOGGER.info("DM920 Streamlink Server v%s - Ultimate Optimizations", __version__)
+    LOGGER.info("CPU: 2 cores, NEON enabled, %dMB RAM", get_total_memory_mb())
+    LOGGER.info("Settings: prebuffer=%dKB, chunks=%dKB, threads=%d, live-edge=%d",
+                BUFFER_CONFIG["DEFAULT_PREBUFFER"]//1024,
+                BUFFER_CONFIG["STREAM_CHUNK_SIZE"]//1024,
+                BUFFER_CONFIG["HLS_SEGMENT_THREADS"],
+                BUFFER_CONFIG["HLS_LIVE_EDGE"])
+    LOGGER.info("User-Agent: %s", DEFAULT_USER_AGENT)
+    PARSER = build_parser()
+    GLOBAL_STREAMLINK = create_fresh_streamlink_session()
+    httpd = ThreadedHTTPServer(("", PORT_NUMBER), StreamHandler)
+    versions = get_system_versions()
+    LOGGER.info("Streamlink v%s, GStreamer %s, FFmpeg %s",
+                streamlink_version, versions['gstreamer'], versions['ffmpeg'])
+    original_sigtstp = signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+    original_sigquit = signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        LOGGER.info("Shutting down...")
+    finally:
+        httpd.server_close()
+        signal.signal(signal.SIGTSTP, original_sigtstp)
+        signal.signal(signal.SIGQUIT, original_sigquit)
+        LOGGER.info("Server stopped")
+
+
+class Daemon:
+    def __init__(self, pidfile, stdin="/dev/null", stdout="/dev/null", stderr="/dev/null"):
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pidfile = pidfile
+
+    def daemonize(self):
+        try:
+            pid = os.fork()
+            if pid > 0:
+                sys.exit(0)
+        except OSError as e:
+            sys.stderr.write("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+        os.chdir("/")
+        os.setsid()
+        os.umask(0)
+        try:
+            pid = os.fork()
+            if pid > 0:
+                sys.exit(0)
+        except OSError as e:
+            sys.stderr.write("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        si = open(self.stdin, "r")
+        so = open(self.stdout, "a+")
+        se = open(self.stderr, "a+")
+        os.dup2(si.fileno(), sys.stdin.fileno())
+        os.dup2(so.fileno(), sys.stdout.fileno())
+        os.dup2(se.fileno(), sys.stderr.fileno())
+        atexit.register(self.delpid)
+        pid = str(os.getpid())
+        open(self.pidfile, "w+").write("%s\n" % pid)
+
+    def delpid(self):
+        try:
+            os.remove(self.pidfile)
+        except OSError:
+            pass
+
+    def start(self):
+        try:
+            with open(self.pidfile, "r") as pf:
+                pid = int(pf.read().strip())
+            if pid:
+                sys.stderr.write("Daemon already running\n")
+                sys.exit(1)
+        except (IOError, ValueError):
+            pass
+        self.daemonize()
+        self.run()
+
+    def stop(self):
+        try:
+            with open(self.pidfile, "r") as pf:
+                pid = int(pf.read().strip())
+        except (IOError, ValueError):
+            sys.stderr.write("Not running\n")
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.5)
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        except OSError as err:
+            if "No such process" in str(err):
+                if os.path.exists(self.pidfile):
+                    os.remove(self.pidfile)
+            else:
+                print(str(err))
+                sys.exit(1)
+
+    def restart(self):
+        self.stop()
+        self.start()
+
+    def run(self):
+        start()
+
+
+class StreamlinkDaemon(Daemon):
+    def run(self):
+        start()
+
+
+if __name__ == "__main__":
+    daemon = StreamlinkDaemon("/var/run/streamlink.pid")
+    if len(sys.argv) >= 2:
+        if "start" == sys.argv[1]:
+            daemon.start()
+        elif "stop" == sys.argv[1]:
+            daemon.stop()
+        elif "restart" == sys.argv[1]:
+            daemon.restart()
+        elif "manualstart" == sys.argv[1]:
+            daemon.stop()
+            if len(sys.argv) > 2 and sys.argv[2] in ("debug", "trace"):
+                set_loglevel(sys.argv[2])
+            start()
+        else:
+            print("Unknown command")
+            sys.exit(2)
+        sys.exit(0)
+    else:
+        print("usage: %s start|stop|restart|manualstart" % sys.argv[0])
+        print("          manualstart include a stop")
+        sys.exit(2)

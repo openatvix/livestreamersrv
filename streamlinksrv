@@ -91,6 +91,28 @@ LOG_DIR = os.path.expanduser(XDG_STATE_HOME + "/streamlink/logs")
 # Chrome User Agent - Same as all other components
 DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+
+# --- FIX: YouTube Error 153 ---
+# YouTube now rejects embedded-player requests that lack a valid Referer/Origin.
+# This helper sets those headers on a requests.Session (http session).
+# Apply only for YouTube URLs to avoid breaking other plugins.
+def apply_youtube_safe_headers(http_session):
+    try:
+        if http_session is None or not hasattr(http_session, 'headers'):
+            return
+        http_session.headers.update({
+            'Referer': 'https://www.youtube.com/',
+            'Origin': 'https://www.youtube.com',
+            'Accept-Language': 'en-US,en;q=0.9',
+        })
+    except Exception as e:
+        try:
+            LOGGER.debug("apply_youtube_safe_headers failed: %s", e)
+        except Exception:
+            pass
+# --- END FIX ---
+
+
 # DM920 ULTIMATE OPTIMIZED CONFIG
 BUFFER_CONFIG = {
     "DEFAULT_PREBUFFER": 32768,              # Increased for faster start
@@ -983,6 +1005,18 @@ def Stream(streamlink, http, url, argstr, quality):
                     resolved_url
                 )
             plugin = pluginclass(streamlink, resolved_url)
+
+        # --- FIX: YouTube Error 153 ---
+        # Inject Referer/Origin only for YouTube URLs so other plugins are not affected.
+        # YouTube's embedded player now rejects requests without a valid referrer context.
+        if pluginname == "youtube":
+            try:
+                apply_youtube_safe_headers(streamlink.http)
+                LOGGER.debug("YouTube safe headers applied (Referer/Origin)")
+            except Exception as e:
+                LOGGER.debug("Could not apply YouTube headers: %s", e)
+        # --- END FIX ---
+
         if PARSER and PLUGIN_ARGS and args:
             setup_plugin_options(streamlink, plugin, args, pluginname)
             log_current_arguments(streamlink, args, url, quality)
